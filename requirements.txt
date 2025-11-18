@@ -2,5 +2,10 @@ requests
 sentence-transformers
 faiss-cpu
 numpy
-tqdm
+networkx
 python-dotenv
+PyPDF2
+pytesseract
+pdf2image
+Pillow
+zai-sdk

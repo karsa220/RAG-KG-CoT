@@ -1,267 +1,343 @@
 #!/usr/bin/env python3
-# history_hotspots_rag_glm.py
+# academic_rag_agent_clean.py
 
-import os
-import json
-import time
-import requests
+import os, time, json, requests
+from dataclasses import dataclass, field
 from typing import List, Dict, Any, Tuple
+
+# --- Load .env ---
 from dotenv import load_dotenv
 
-# Embedding / vector search
-try:
-    from sentence_transformers import SentenceTransformer
-    import faiss
-    import numpy as np
-    REAL_EMBED = True
-except:
-    REAL_EMBED = False
-
-# ----------------------------
-# 1. Load ZhipuAI client
-# ----------------------------
-from zai import ZhipuAiClient
 load_dotenv()
-ZHIPU_API_KEY = os.getenv("ZHIPU_API_KEY")
 
-if not ZHIPU_API_KEY:
-    raise RuntimeError("请在 .env 中设置 ZHIPU_API_KEY！")
+# --- Optional deps ---
+from sentence_transformers import SentenceTransformer
+import faiss
+import numpy as np
+import networkx as nx
+import PyPDF2
+import pytesseract
+from PIL import Image
+from pdf2image import convert_from_path
 
-client = ZhipuAiClient(api_key=ZHIPU_API_KEY)
+# --- LLM client (GLM-4.5) ---
+from zhipuai import ZhipuAI
 
-# ----------------------------
-# 2. Mock dataset (fallback)
-# ----------------------------
-MOCK_PAPERS = [
-    {
-        "id": "m1",
-        "title": "OCR Correction for Historical Documents",
-        "abstract": "We propose LM-based post-processing to reduce OCR character error rates across 19th-century scanned texts.",
-        "year": 2024,
-        "source": "mock"
-    },
-    {
-        "id": "m2",
-        "title": "Social Networks of Qing Dynasty",
-        "abstract": "We build networks from archival correspondence to study political influence structures.",
-        "year": 2023,
-        "source": "mock"
-    },
-    {
-        "id": "m3",
-        "title": "NER for Gazetteers",
-        "abstract": "Applying NER to historical gazetteers helps extract place-names and administrative units.",
-        "year": 2024,
-        "source": "mock"
+ZHIPU_KEY = os.getenv("ZHIPU_API_KEY", None)
+if not ZHIPU_KEY:
+    raise ValueError("❌ ERROR: 请在 .env 中设置 ZHIPU_API_KEY=xxxx")
+zai_client = ZhipuAI(api_key=ZHIPU_KEY)
+
+# --- Config ---
+USE_ARXIV = True
+USE_OPENALEX = True
+MAX_RESULTS = 50
+
+
+# ===========================
+#       DATA STRUCTURE
+# ===========================
+@dataclass
+class Paper:
+    id: str
+    title: str
+    abstract: str
+    authors: List[str] = field(default_factory=list)
+    year: int = None
+    doi: str = None
+    source: str = None
+    pdf_url: str = None
+
+
+# ===========================
+#       RETRIEVAL MODULES
+# ===========================
+
+# ---- ArXiv ----
+def search_arxiv(query: str, max_results: int = MAX_RESULTS) -> List[Paper]:
+    print(f"[INFO] Searching ArXiv for: {query}")
+
+    url = "http://export.arxiv.org/api/query"
+    params = {
+        "search_query": f"all:{query}",
+        "start": 0,
+        "max_results": max_results
     }
-]
 
-# ----------------------------
-# 3. OpenAlex Fetcher
-# ----------------------------
-def fetch_openalex(query: str, max_results=200):
-    base = "https://api.openalex.org/works"
+    r = requests.get(url, params=params, timeout=20)
+    r.raise_for_status()
+    txt = r.text
+
+    papers = []
+    entries = txt.split("<entry>")[1:]
+
+    import re
+    for e in entries:
+        title = re.search(r"<title>(.*?)</title>", e, re.S)
+        title = title.group(1).strip() if title else "Untitled"
+
+        abstract = re.search(r"<summary>(.*?)</summary>", e, re.S)
+        abstract = abstract.group(1).strip() if abstract else ""
+
+        pid = re.search(r"<id>(.*?)</id>", e)
+        pid = pid.group(1).strip() if pid else None
+
+        authors = re.findall(r"<name>(.*?)</name>", e)
+
+        yearm = re.search(r"<published>(\d{4})", e)
+        year = int(yearm.group(1)) if yearm else None
+
+        pdf_url = None
+        pdf_match = re.search(r'<link title="pdf" href="(.*?)"/>', e)
+        if pdf_match:
+            pdf_url = pdf_match.group(1)
+
+        papers.append(Paper(
+            id=pid, title=title, abstract=abstract,
+            authors=authors, year=year,
+            source="arxiv", pdf_url=pdf_url
+        ))
+
+    return papers
+
+
+# ---- OpenAlex ----
+def fetch_openalex_works(query: str, from_year=2023, max_results=MAX_RESULTS) -> List[Paper]:
+    print(f"[INFO] Searching OpenAlex for: {query}")
+
+    url = "https://api.openalex.org/works"
     params = {
         "search": query,
-        "filter": "from_publication_date:2023-01-01",
-        "per-page": 200
+        "filter": f"from_publication_date:{from_year}-01-01",
+        "per-page": 50,
+        "page": 1
     }
 
-    r = requests.get(base, params=params, timeout=10)
-    data = r.json()
-    works = data.get("results", [])
+    results = []
+    while len(results) < max_results:
+        r = requests.get(url, params=params, timeout=20)
+        r.raise_for_status()
+        data = r.json()
 
-    out = []
-    for w in works[:max_results]:
-        abstract = None
-        if w.get("abstract") is not None:
-            abstract = w["abstract"]
-        elif w.get("abstract_inverted_index") is not None:
-            inv = w["abstract_inverted_index"]
-            max_pos = max([max(v) for v in inv.values()])
-            tokens = [""] * (max_pos + 1)
-            for tok, idxs in inv.items():
-                for i in idxs:
-                    tokens[i] = tok
-            abstract = " ".join(tokens)
+        items = data.get("results", [])
+        if not items:
+            break
 
-        out.append({
-            "id": w["id"],
-            "title": w["title"],
-            "abstract": abstract or "",
-            "year": w.get("publication_year"),
-            "source": "openalex"
-        })
+        for it in items:
+            abstract = it.get("abstract") or ""
+            results.append(Paper(
+                id=it.get("id"),
+                title=it.get("title"),
+                abstract=abstract,
+                authors=[a["author"]["display_name"] for a in it.get("authorships", [])],
+                year=it.get("publication_year"),
+                doi=it.get("doi"),
+                source="openalex"
+            ))
 
-    return out
+        params["page"] += 1
+        if len(items) < 50:
+            break
+        time.sleep(0.2)
 
-
-# ----------------------------
-# 4. Retriever
-# ----------------------------
-class Retriever:
-    def __init__(self):
-        if REAL_EMBED:
-            self.model = SentenceTransformer("all-MiniLM-L6-v2")
-        else:
-            self.model = None
-        self.index = None
-        self.ids = []
-        self.corpus = []
-        self.docs = {}
-
-    def build(self, docs):
-        self.docs = {d["id"]: d for d in docs}
-        self.ids = [d["id"] for d in docs]
-        self.corpus = [
-            d["title"] + ". " + (d["abstract"] or "")
-            for d in docs
-        ]
-
-        if REAL_EMBED:
-            print("[INFO] Building FAISS index...")
-            emb = self.model.encode(self.corpus, convert_to_tensor=False)
-            emb = np.array(emb).astype("float32")
-            faiss.normalize_L2(emb)
-            d = emb.shape[1]
-            self.index = faiss.IndexFlatIP(d)
-            self.index.add(emb)
-            self.emb_matrix = emb
-        else:
-            print("[WARN] sentence-transformers unavailable → fallback keyword search.")
-            self.index = None
-
-    def search(self, query, k=20):
-        if self.index is None:
-            # fallback: keyword match
-            qt = set(query.lower().split())
-            scored = []
-            for i, txt in enumerate(self.corpus):
-                score = len(qt & set(txt.lower().split()))
-                scored.append((self.ids[i], score))
-            return sorted(scored, key=lambda x: x[1], reverse=True)[:k]
-
-        # real embedding search
-        q_emb = self.model.encode([query], convert_to_tensor=False)
-        q_emb = np.array(q_emb).astype("float32")
-        faiss.normalize_L2(q_emb)
-        D, I = self.index.search(q_emb, k)
-        out = []
-        for idx, score in zip(I[0], D[0]):
-            out.append((self.ids[idx], float(score)))
-        return out
+    return results[:max_results]
 
 
-# ----------------------------
-# 5. ZhipuAI Chat wrapper
-# ----------------------------
-def chat_with_glm(prompt: str) -> str:
-    """
-    使用 GLM-4.5-FLASH 进行 RAG 总结
-    """
-    print("[INFO] 调用 GLM 模型生成总结（流式输出）...\n")
+# ---- Combine sources ----
+def multi_source_search(query: str) -> List[Paper]:
+    results = []
+    if USE_ARXIV:
+        results.extend(search_arxiv(query))
+    if USE_OPENALEX:
+        results.extend(fetch_openalex_works(query))
 
-    response = client.chat.completions.create(
+    # Dedup by id
+    seen = set()
+    final = []
+    for p in results:
+        key = p.id or p.title
+        if key not in seen:
+            seen.add(key)
+            final.append(p)
+
+    print(f"[INFO] Total papers retrieved: {len(final)}")
+    return final
+
+
+# ===========================
+#       EMBEDDING + FAISS
+# ===========================
+
+class EmbeddingManager:
+    def __init__(self, model_name="all-MiniLM-L6-v2"):
+        print(f"[INFO] Loading embedding model: {model_name}")
+        self.model = SentenceTransformer(model_name)
+
+    def encode(self, texts: List[str]):
+        return self.model.encode(texts, convert_to_tensor=False, show_progress_bar=False)
+
+
+class FaissIndex:
+    def __init__(self, dim=384):
+        self.dim = dim
+        self.index = faiss.IndexFlatIP(dim)
+
+    def build(self, embeddings, ids):
+        emb = np.array(embeddings, dtype="float32")
+        faiss.normalize_L2(emb)
+        self.index.add(emb)
+        self.ids = ids
+        self.emb_matrix = emb
+
+    def search(self, q_emb, topk=10):
+        q = np.array(q_emb, dtype="float32").reshape(1, -1)
+        faiss.normalize_L2(q)
+        D, I = self.index.search(q, topk)
+        return [(int(I[0][i]), float(D[0][i])) for i in range(topk)]
+
+
+# ===========================
+#         PDF PARSING
+# ===========================
+
+def parse_pdf_text(path: str, max_pages=5) -> str:
+    try:
+        reader = PyPDF2.PdfReader(path)
+        text = []
+        for i, page in enumerate(reader.pages[:max_pages]):
+            text.append(page.extract_text() or "")
+        text = "\n".join(text).strip()
+        if len(text) > 200:
+            return text
+    except:
+        text = ""
+
+    # OCR fallback
+    try:
+        images = convert_from_path(path, first_page=1, last_page=max_pages)
+        ocr_texts = [pytesseract.image_to_string(img) for img in images]
+        return "\n".join(ocr_texts)
+    except:
+        return text
+
+
+# ===========================
+#         CITATION GRAPH
+# ===========================
+
+def build_citation_graph(papers: List[Paper]) -> nx.DiGraph:
+    G = nx.DiGraph()
+    for p in papers:
+        G.add_node(p.id, title=p.title, year=p.year, source=p.source)
+
+    # OpenAlex references
+    for p in papers:
+        if p.source == "openalex":
+            try:
+                r = requests.get(p.id, timeout=10)
+                data = r.json()
+                for ref in data.get("referenced_works", []):
+                    G.add_edge(p.id, ref, relation="cites")
+            except:
+                pass
+
+    print(f"[INFO] KG built: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
+    return G
+
+
+# ===========================
+#         LLM CALL
+# ===========================
+
+def call_llm(prompt: str) -> str:
+    resp = zai_client.chat.completions.create(
         model="glm-4.5-flash",
         messages=[
-            {"role": "system", "content": "你是一名历史学研究趋势分析专家。"},
+            {"role": "system", "content": "You are an expert research summarizer."},
             {"role": "user", "content": prompt}
         ],
-        stream=True,
         thinking={"type": "enabled"},
+        stream=False,
         max_tokens=2048,
         temperature=0.2
     )
-
-    final_text = ""
-
-    for chunk in response:
-        delta = chunk.choices[0].delta.content
-        if delta:
-            print(delta, end="", flush=True)
-            final_text += delta
-
-    print("\n\n[INFO] GLM 总结完成。\n")
-    return final_text
+    return resp.choices[0].message.content
 
 
-# ----------------------------
-# 6. Full RAG pipeline
-# ----------------------------
-def run_pipeline(query: str, use_openalex=False):
-    print("\n=========== 🧠 历史学热点 RAG 系统 ===========\n")
+# ===========================
+#       AGENT EXECUTION
+# ===========================
 
-    # Step 1: fetch real or mock papers
-    if use_openalex:
-        print("[INFO] 正在从 OpenAlex 拉取真实论文...")
-        docs = fetch_openalex(query)
-        if not docs:
-            print("[WARN] 无法从 OpenAlex 获取，fallback 到 mock")
-            docs = MOCK_PAPERS
-    else:
-        docs = MOCK_PAPERS
+def agent_run(query: str, top_k=20):
+    print("\n================ AGENT START ==============")
+    print("[QUERY]:", query)
 
-    print(f"[INFO] 文献数量：{len(docs)}")
+    # 1. Retrieval
+    papers = multi_source_search(query)
 
-    # Step 2: build retriever
-    r = Retriever()
-    r.build(docs)
+    # 2. Embedding
+    emb = EmbeddingManager()
+    texts = [p.title + ". " + (p.abstract or "") for p in papers]
+    vecs = emb.encode(texts)
 
-    # Step 3: search
-    hits = r.search(query, k=20)
-    print(f"[INFO] 检索到 {len(hits)} 条文献。")
+    # 3. FAISS
+    dim = len(vecs[0])
+    index = FaissIndex(dim)
+    ids = [i for i in range(len(papers))]
+    index.build(vecs, ids)
 
-    # Step 4: assemble text for LLM
-    evidence = []
-    for pid, score in hits:
-        doc = r.docs[pid]
-        snippet = doc["title"] + "\n" + doc["abstract"][:500]
-        evidence.append(snippet)
+    qvec = emb.encode([query])[0]
+    hits = index.search(qvec, topk=min(top_k, len(papers)))
+    print(f"[INFO] Top-{len(hits)} retrieved by embedding")
 
-    evidence_text = "\n\n".join(evidence)
+    # 4. Citation graph
+    G = build_citation_graph(papers)
 
-    # Step 5: call GLM
-    PROMPT = f"""
-请根据以下最新历史学文献（均为2023-2025年）内容，分析「历史学最新研究热点」。
+    # 5. Evidence snippets
+    snippets = []
+    for idx, score in hits:
+        p = papers[idx]
+        snippets.append(f"{p.title} ({p.year})\n{p.abstract[:800]}")
 
-文献列表：
-{evidence_text}
+    evidence = "\n\n".join(snippets)
 
-请输出：
-1. 一个对历史学领域过去两年（2023–2025）的整体趋势总结  
-2. 五大研究热点（每个热点 2 句解释）  
-3. 每个热点至少列出两篇代表论文（标题 + 年份）  
-4. 给出三个未来可研究方向（可作为科研选题）
+    # 6. LLM Summarization
+    prompt = f"""
+User query: {query}
 
-请用清晰结构化格式回答。
+Based on the following retrieved papers, produce:
+1. Overview
+2. Top 5 research hotspots
+3. 2 representative papers per hotspot
+4. 3 research project ideas
+
+Evidence:
+{evidence}
 """
 
-    summary = chat_with_glm(PROMPT)
+    out = call_llm(prompt)
+    print("\n================ LLM OUTPUT ===============")
+    print(out)
 
-    # Step 6: return
-    return {
+    # Save result
+    result = {
         "query": query,
-        "llm_output": summary,
-        "retrieved_papers": hits
+        "papers": [p.__dict__ for p in papers],
+        "hits": hits,
+        "llm_summary": out
     }
+    json.dump(result, open("academic_rag_clean_last.json", "w", encoding="utf-8"), indent=2)
+
+    print("\nSaved: academic_rag_clean_last.json")
+    return result
 
 
-# ----------------------------
-# CLI
-# ----------------------------
-def main():
-    print("=== 历史学热点检索助手（RAG + GLM） ===")
-    query = input("请输入你的问题（例如：历史学 最新 研究 热点）:\n> ").strip()
-    if not query:
-        query = "历史学 最新 研究 热点"
-
-    out = run_pipeline(query, use_openalex=False)
-
-    with open("history_rag_output.json", "w", encoding="utf-8") as f:
-        json.dump(out, f, ensure_ascii=False, indent=2)
-
-    print("\n结果已保存到 history_rag_output.json\n")
-
+# ===========================
+#            CLI
+# ===========================
 
 if __name__ == "__main__":
-    main()
+    q = input("请输入你的科研问题:\n> ").strip()
+    if not q:
+        q = "large language model robustness research hotspots"
+    agent_run(q)
