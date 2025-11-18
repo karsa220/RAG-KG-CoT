@@ -65,10 +65,3 @@ yaml
 复制代码
 
 ---
-
-# 🚀 快速开始（Quick Start）
-
-## 1. 克隆项目
-```bash
-git clone https://github.com/xxx/AcademicRAG.git
-cd AcademicRAG
