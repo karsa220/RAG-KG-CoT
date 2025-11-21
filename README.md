@@ -61,7 +61,5 @@ GLM-4.5 CoT Reasoning
 ↓
 Final Structured Output (热点 / 论文 / 趋势 / 建议)
 
-yaml
-复制代码
 
 ---
